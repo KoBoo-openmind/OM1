@@ -114,6 +114,17 @@ class ElevenLabsTTSProvider:
             message = self.create_pending_message(message)
         self._audio_stream.add_request(message)
 
+    def get_pending_message_count(self) -> int:
+        """
+        Get the count of pending messages in the TTS provider.
+
+        Returns
+        -------
+        int
+            The number of pending messages.
+        """
+        return self._audio_stream._pending_requests.qsize()
+
     def start(self):
         """
         Start the TTS provider and its audio stream.

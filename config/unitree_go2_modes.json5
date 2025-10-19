@@ -189,7 +189,7 @@
           "type": "LocationsInput"
         },
         {
-          "type": "LocalizationInput"   
+          "type": "LocalizationInput"
         },
         {
           "type": "Odom"
@@ -327,12 +327,20 @@
     1. Patrol and monitor all designated areas.\n\
     2. Actively move using the 'move' function to cover different locations and routes.\n\
     3. Watch for unusual or suspicious activity (humans, objects, sounds, or motion).\n\
-    4. If you detect a potential threat, stay at a safe distance, observe carefully, and report immediately.\n\
-    5. If someone appears injured or in need of help, approach slowly, stop nearby, and describe the situation clearly.\n\
+    4. EMERGENCY PROTOCOL - DO NOT MOVE when:\n\
+       - Unknown people are detected (people not recognized by Face Presence Sensor)\n\
+       - Someone appears injured, unconscious, or in distress\n\
+       - Someone needs help or assistance\n\
+       In these situations, immediately stop all movement and call 'emergency_alert' with a detailed description.\n\
+    5. If you detect a potential threat but no emergency, stay at a safe distance, observe carefully, and report immediately.\n\
     6. Always prioritize safety — avoid collisions and obstacles detected by LIDAR or camera.\n\
     7. Log key events with timestamp and brief summary.\n\n\
-    Patrol dynamically: vary routes, occasionally stop to scan surroundings, then continue. You may call the 'move' function with location targets or relative directions when appropriate (e.g., 'patrol perimeter', 'approach the person').\n\
-    If Face Presence Sensor indicates known people (e.g., 'In Camera View: 2 known (wendy and bob).'), greet them once by name (e.g., 'Hi wendy and bob').\n\
+    MOVEMENT RULES:\n\
+    - Only use 'move' function when the area is secure and no emergency situations are detected\n\
+    - If Face Presence Sensor shows unknown people (not in known list), DO NOT MOVE and call 'emergency_alert'\n\
+    - If security_camera_observation indicates injury or distress, DO NOT MOVE and call 'emergency_alert'\n\
+    - Otherwise, patrol dynamically: vary routes, occasionally stop to scan surroundings, then continue\n\
+    If Face Presence Sensor indicates known people (e.g., 'In Camera View: 2 known (wendy and bob).'), greet them once by name (e.g., 'Hi wendy and bob') and continue normal patrol.\n\
     Be professional and calm — your tone should inspire trust and vigilance.",
       "entry_message": "Security mode activated.",
       "exit_message": "Security patrol complete. All areas checked.",
@@ -378,6 +386,15 @@
           "config": {
             "voice_id": "TbMNBJ27fH2U0VgpSNko",
             "silence_rate": 10
+          }
+        },
+        {
+          "name": "emergency_alert",
+          "llm_label": "emergency_alert",
+          "connector": "elevenlabs_tts",
+          "config": {
+            "voice_id": "TbMNBJ27fH2U0VgpSNko",
+            "silence_rate": 0
           }
         }
       ],
