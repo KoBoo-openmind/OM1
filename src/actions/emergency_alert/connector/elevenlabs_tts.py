@@ -124,10 +124,7 @@ class EmergencyAlertElevenLabsTTSConnector(ActionConnector[EmergencyAlertInput])
             self.conversation_provider.store_robot_message(output_interface.action)
 
         # Avoid queuing too many TTS messages
-        logging.info(
-            f"Current pending TTS message count: {self.tts.get_pending_message_count()}"
-        )
-        if self.tts.get_pending_message_count() > 1:
+        if self.tts.get_pending_message_count() > 0:
             logging.warning(
                 "Too many pending TTS messages, skipping adding new message"
             )
