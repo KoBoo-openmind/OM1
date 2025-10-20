@@ -100,6 +100,14 @@
                                     "full_autonomy_guidelines/om1_video_processor"
                                 ]
 
+                            },
+                            {
+                                "group": "Modes",
+                                "pages": [
+                                    "full_autonomy_guidelines/modes",
+                                    "full_autonomy_guidelines/mode_selection"
+                                ]
+
                             }
                         ]
                     },
