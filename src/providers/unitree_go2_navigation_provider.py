@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Optional
 from uuid import uuid4
 
@@ -94,6 +95,13 @@ class UnitreeGo2NavigationProvider:
         self.running: bool = False
         self._nav_in_progress: bool = False
         self._current_destination: Optional[str] = None  # Track destination name
+        
+        # Goal tracking for duplicate prevention
+        self._last_published_goal: Optional[geometry_msgs.PoseStamped] = None
+        self._last_destination_name: Optional[str] = None
+        self._last_goal_time: float = 0.0
+        self._goal_publish_count: int = 0
+        self._arrival_announced: bool = False  # Prevent duplicate arrival announcements
 
         # TTS provider for speech feedback
         self.tts_provider = ElevenLabsTTSProvider()
@@ -156,18 +164,35 @@ class UnitreeGo2NavigationProvider:
                         )  # Re-enable AI ONLY on success
                         logging.info("Navigation succeeded - AI mode re-enabled")
 
-                        # Add speech feedback for successful navigation
-                        if self._current_destination:
-                            self.tts_provider.add_pending_message(
-                                f"Yaaay! I have reached the {self._current_destination}. Woof! Woof!"
-                            )
-                        else:
-                            self.tts_provider.add_pending_message(
-                                "Yaaay! I have reached my destination. Woof! Woof!"
-                            )
+                        # DON'T clear goal tracking immediately on success
+                        # Keep destination name to prevent immediate repeated navigation
+                        self._last_published_goal = None  # Clear pose but keep destination name
+                        # self._last_destination_name = None  # KEEP this to prevent repeats
+                        # self._last_goal_time = 0.0  # KEEP this to prevent repeats
+                        
+                        logging.info(f"Keeping destination '{self._last_destination_name}' in memory to prevent immediate repeated navigation")
+
+                        # Add location-specific speech feedback for successful navigation (only once)
+                        if not self._arrival_announced:
+                            if self._current_destination:
+                                arrival_message = self._get_location_specific_arrival_message(self._current_destination)
+                                self.tts_provider.add_pending_message(arrival_message)
+                                logging.info(f"Generated location-specific arrival message for '{self._current_destination}'")
+                            else:
+                                self.tts_provider.add_pending_message(
+                                    "Yaaay! I have reached my destination. Woof! Woof!"
+                                )
+                            self._arrival_announced = True  # Mark as announced to prevent repeats
                 elif status_code in (5, 6):  # CANCELED or ABORTED
                     if self._nav_in_progress:
                         self._nav_in_progress = False
+                        
+                        # Clear goal tracking on failure/cancellation too
+                        self._last_published_goal = None
+                        self._last_destination_name = None
+                        self._last_goal_time = 0.0
+                        self._arrival_announced = False  # Reset arrival announcement
+                        
                         # Do NOT re-enable AI mode on failure/cancellation
                         logging.warning(
                             "Navigation %s (code=%d) - AI mode remains disabled",
@@ -234,6 +259,7 @@ class UnitreeGo2NavigationProvider:
     ):
         """
         Publish a goal pose to the navigation topic.
+        Includes robust duplicate detection to prevent repeated goal publications.
 
         Parameters
         ----------
@@ -246,6 +272,39 @@ class UnitreeGo2NavigationProvider:
             logging.error("Cannot publish goal pose; Zenoh session is not available.")
             return
 
+        # Clear old destination tracking if enough time has passed
+        self._clear_old_destination_if_needed()
+
+        # Enhanced duplicate detection
+        current_time = time.time()
+        
+        # Check if this is a duplicate goal by position and orientation
+        if self._is_duplicate_goal(pose):
+            logging.info(f"Duplicate goal detected for '{destination_name}' - skipping publication to prevent repeated navigation")
+            return
+            
+        # Check if same destination name within reasonable time window (30 seconds)
+        if (destination_name and 
+            destination_name == self._last_destination_name and 
+            hasattr(self, '_last_goal_time') and 
+            current_time - self._last_goal_time < 30.0):
+            logging.info(f"Same destination '{destination_name}' requested within 30 seconds - skipping to prevent repeated navigation")
+            return
+            
+        # Check if navigation is already in progress to same destination
+        if (self._nav_in_progress and 
+            destination_name and 
+            destination_name == self._last_destination_name):
+            logging.info(f"Navigation to '{destination_name}' already in progress - skipping duplicate request")
+            return
+
+        # Track this goal to prevent future duplicates
+        self._last_published_goal = pose
+        self._last_destination_name = destination_name
+        self._last_goal_time = current_time
+        self._goal_publish_count += 1
+        self._arrival_announced = False  # Reset arrival announcement for new goal
+        
         # Store destination name for speech feedback
         self._current_destination = destination_name
 
@@ -257,7 +316,52 @@ class UnitreeGo2NavigationProvider:
         self._nav_in_progress = True
         payload = ZBytes(pose.serialize())
         self.session.put(self.goal_pose_topic, payload)
-        logging.info("Published goal pose to topic: %s", self.goal_pose_topic)
+        logging.info(f"Published goal pose #{self._goal_publish_count} for '{destination_name}' to topic: {self.goal_pose_topic}")
+
+    def _is_duplicate_goal(self, new_pose: geometry_msgs.PoseStamped) -> bool:
+        """
+        Check if the new goal is a duplicate of the last published goal.
+        
+        Parameters
+        ----------
+        new_pose : geometry_msgs.PoseStamped
+            The new pose to check for duplication
+            
+        Returns
+        -------
+        bool
+            True if this is a duplicate goal, False otherwise
+        """
+        if self._last_published_goal is None:
+            return False
+            
+        # Define tolerance for position and orientation comparison
+        position_tolerance = 0.1  # 10 cm
+        orientation_tolerance = 0.1  # ~5.7 degrees
+        
+        # Compare positions
+        old_pos = self._last_published_goal.pose.position
+        new_pos = new_pose.pose.position
+        
+        pos_diff = (
+            (old_pos.x - new_pos.x) ** 2 +
+            (old_pos.y - new_pos.y) ** 2 +
+            (old_pos.z - new_pos.z) ** 2
+        ) ** 0.5
+        
+        # Compare orientations (quaternions)
+        old_ori = self._last_published_goal.pose.orientation
+        new_ori = new_pose.pose.orientation
+        
+        ori_diff = (
+            (old_ori.x - new_ori.x) ** 2 +
+            (old_ori.y - new_ori.y) ** 2 +
+            (old_ori.z - new_ori.z) ** 2 +
+            (old_ori.w - new_ori.w) ** 2
+        ) ** 0.5
+        
+        # Return True if both position and orientation are within tolerance
+        return pos_diff < position_tolerance and ori_diff < orientation_tolerance
 
     def clear_goal_pose(self):
         """
@@ -275,6 +379,13 @@ class UnitreeGo2NavigationProvider:
             self.session.put(self.cancel_goal_topic, cancel_payload)
             logging.info("Sent cancel all goals request to: %s", self.cancel_goal_topic)
             self._nav_in_progress = False
+            
+            # Clear goal tracking variables
+            self._last_published_goal = None
+            self._last_destination_name = None
+            self._last_goal_time = 0.0
+            self._arrival_announced = False  # Reset arrival announcement
+            
         except Exception:
             logging.exception("Failed to cancel navigation goals")
 
@@ -301,3 +412,113 @@ class UnitreeGo2NavigationProvider:
             True if navigation is in progress, False otherwise.
         """
         return self._nav_in_progress
+    
+    def _get_location_specific_arrival_message(self, destination: str) -> str:
+        """
+        Generate a location-specific arrival message with interesting context.
+        
+        Parameters
+        ----------
+        destination : str
+            The destination name (e.g., 'kitchen', 'charger', 'front door')
+            
+        Returns
+        -------
+        str
+            A contextual arrival message for the location
+        """
+        destination_lower = destination.lower()
+        
+        # Location-specific messages with interesting context
+        location_messages = {
+            'kitchen': [
+                "Woof! I've reached the kitchen! This is where all the delicious smells come from. I can sense the aroma of past meals lingering in the air!",
+                "Yaaay! I'm at the kitchen! This is the heart of the home where culinary magic happens. I bet there are tasty treats somewhere around here!",
+                "I've arrived at the kitchen! This is where humans prepare their food. I love the sounds of cooking and the warmth that comes from this special place!"
+            ],
+            'charger': [
+                "Perfect! I've reached my charging station! Time for some well-deserved rest and energy replenishment. This is my cozy power nap spot!",
+                "Woof! I'm at the charger! This is my special recharging sanctuary where I restore my energy. Just like humans need sleep, I need my power station!",
+                "I've made it to the charger! This is my energy oasis - the place where I get recharged and ready for more adventures with you!"
+            ],
+            'front door': [
+                "I've reached the front door! This is the gateway between our cozy home and the exciting world outside. I can sense all the interesting smells from beyond!",
+                "Woof! I'm at the front door! This is the portal where visitors come and go, bringing new adventures and stories into our home!",
+                "I've arrived at the front door! This is the threshold of possibilities - the entrance to our safe haven and the exit to outdoor adventures!"
+            ],
+            'home': [
+                "I'm back home! This is my favorite spot - the place where I feel safe, comfortable, and surrounded by everything familiar. There's no place like home!",
+                "Woof! I've returned home! This is my sanctuary, my base of operations, where all my adventures begin and end. Home sweet home!",
+                "I've reached home base! This is where I belong - surrounded by familiar sights, sounds, and that special feeling of being exactly where I should be!"
+            ],
+            'living room': [
+                "I've made it to the living room! This is where relaxation happens - soft furniture, cozy corners, and the perfect spot for quality time together!",
+                "Woof! I'm in the living room! This is the social heart of the home where everyone gathers to unwind and share their day!"
+            ],
+            'bedroom': [
+                "I've reached the bedroom! This is the peaceful sanctuary where dreams are made and rest is found. Such a calm and serene space!",
+                "Woof! I'm at the bedroom! This is the quiet retreat where humans recharge their energy, just like I do at my charging station!"
+            ],
+            'office': [
+                "I've arrived at the office! This is the productivity zone where important work gets done. I can sense the focused energy of this space!",
+                "Woof! I'm at the office! This is the thinking headquarters where ideas come to life and tasks get accomplished!"
+            ],
+            'garage': [
+                "I've reached the garage! This is the mechanical sanctuary filled with tools, vehicles, and the scent of industry. What interesting machines live here!",
+                "Woof! I'm in the garage! This is the workshop where things get fixed and projects come to life. I love the organized chaos of this space!"
+            ],
+            'bathroom': [
+                "I've arrived at the bathroom! This is the refreshing sanctuary where humans get clean and tidy. The tiles feel cool under my sensors!",
+                "Woof! I'm at the bathroom! This is the splashing zone where water flows and cleanliness happens. Such interesting echoes in here!"
+            ],
+            'dining room': [
+                "I've reached the dining room! This is where families gather to share meals and stories. I can imagine all the wonderful conversations that happen here!",
+                "Woof! I'm in the dining room! This is the feasting hall where delicious meals bring people together. The perfect spot for social bonding!"
+            ],
+            'laundry room': [
+                "I've made it to the laundry room! This is the cleaning command center where fabrics get refreshed and renewed. I love the rhythmic sounds of the machines!",
+                "Woof! I'm at the laundry room! This is where the magic of fresh, clean clothes happens. The warm, sudsy atmosphere is so cozy!"
+            ],
+            'balcony': [
+                "I've reached the balcony! This is the outdoor sanctuary with fresh air and amazing views. What a perfect spot to observe the world beyond!",
+                "Woof! I'm on the balcony! This is the sky-high perch where indoor comfort meets outdoor adventure. The breeze feels wonderful!"
+            ],
+            'garden': [
+                "I've arrived in the garden! This is nature's playground filled with growing plants and fresh earth. I can sense all the life flourishing here!",
+                "Woof! I'm in the garden! This is the green oasis where plants dance in the breeze and flowers share their fragrances. So peaceful!"
+            ]
+        }
+        
+        # Get location-specific messages or use default
+        if destination_lower in location_messages:
+            import random
+            selected_message = random.choice(location_messages[destination_lower])
+            logging.info(f"Selected location-specific message for '{destination}': {selected_message[:50]}...")
+            return selected_message
+        else:
+            # Generic message for unknown locations
+            generic_message = f"Yaaay! I have reached {destination}! This is an interesting place - I'm excited to explore and learn more about this location. Woof! Woof!"
+            logging.info(f"Using generic arrival message for unknown location '{destination}'")
+            return generic_message
+    
+    def _clear_old_destination_if_needed(self):
+        """Clear destination name if enough time has passed since last navigation."""
+        if (self._last_destination_name and 
+            hasattr(self, '_last_goal_time') and 
+            time.time() - self._last_goal_time > 60.0):  # Clear after 60 seconds
+            logging.info(f"Clearing old destination '{self._last_destination_name}' after 60 seconds")
+            self._last_destination_name = None
+            self._last_goal_time = 0.0
+    
+    def get_navigation_debug_info(self) -> dict:
+        """Get comprehensive navigation state information for debugging."""
+        return {
+            "nav_in_progress": self._nav_in_progress,
+            "navigation_status": self.navigation_status,
+            "last_destination_name": self._last_destination_name,
+            "goal_publish_count": self._goal_publish_count,
+            "has_last_published_goal": self._last_published_goal is not None,
+            "last_goal_time": getattr(self, '_last_goal_time', 0.0),
+            "current_time": time.time(),
+            "running": self.running
+        }
