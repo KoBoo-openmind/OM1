@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import json5
 
@@ -13,6 +13,12 @@ from backgrounds.base import Background, BackgroundConfig
 from inputs import load_input
 from inputs.base import Sensor, SensorConfig
 from llm import LLM, LLMConfig, load_llm
+from runtime.multi_mode.hook import (
+    LifecycleHook,
+    LifecycleHookType,
+    execute_lifecycle_hooks,
+    parse_lifecycle_hooks,
+)
 from runtime.robotics import load_unitree
 from runtime.single_mode.config import RuntimeConfig, add_meta
 from simulators import load_simulator
@@ -82,11 +88,12 @@ class ModeConfig:
     system_prompt_base: str
     hertz: float = 1.0
 
-    entry_message: Optional[str] = None
-    exit_message: Optional[str] = None
     timeout_seconds: Optional[float] = None
     remember_locations: bool = False
     save_interactions: bool = False
+
+    lifecycle_hooks: List[LifecycleHook] = field(default_factory=list)
+    _raw_lifecycle_hooks: List[Dict] = field(default_factory=list)
 
     agent_inputs: List[Sensor] = field(default_factory=list)
     cortex_llm: Optional[LLM] = None
@@ -119,6 +126,7 @@ class ModeConfig:
 
         return RuntimeConfig(
             hertz=self.hertz,
+            mode=self.name,
             name=f"{global_config.name}_{self.name}",
             system_prompt_base=self.system_prompt_base,
             system_governance=global_config.system_governance,
@@ -165,6 +173,37 @@ class ModeConfig:
             or len(self.agent_actions) > 0
         )
 
+    async def execute_lifecycle_hooks(
+        self, hook_type: LifecycleHookType, context: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Execute all lifecycle hooks of the specified type for this mode.
+
+        Parameters
+        ----------
+        hook_type : LifecycleHookType
+            The type of lifecycle hooks to execute
+        context : Optional[Dict[str, Any]]
+            Context information to pass to the hooks
+
+        Returns
+        -------
+        bool
+            True if all hooks executed successfully, False if any failed
+        """
+        if context is None:
+            context = {}
+
+        context.update(
+            {
+                "mode_name": self.name,
+                "mode_display_name": self.display_name,
+                "mode_description": self.description,
+            }
+        )
+
+        return await execute_lifecycle_hooks(self.lifecycle_hooks, hook_type, context)
+
 
 @dataclass
 class ModeSystemConfig:
@@ -177,7 +216,6 @@ class ModeSystemConfig:
     default_mode: str
     config_name: str = ""
     allow_manual_switching: bool = True
-    transition_announcement: bool = True
     mode_memory_enabled: bool = True
 
     # Global parameters
@@ -191,9 +229,40 @@ class ModeSystemConfig:
     # Default LLM settings if mode doesn't override
     global_cortex_llm: Optional[Dict] = None
 
+    # Global lifecycle hooks (executed for all modes)
+    global_lifecycle_hooks: List[LifecycleHook] = field(default_factory=list)
+    _raw_global_lifecycle_hooks: List[Dict] = field(default_factory=list)
+
     # Modes and transition rules
     modes: Dict[str, ModeConfig] = field(default_factory=dict)
     transition_rules: List[TransitionRule] = field(default_factory=list)
+
+    async def execute_global_lifecycle_hooks(
+        self, hook_type: LifecycleHookType, context: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Execute all global lifecycle hooks of the specified type.
+
+        Parameters
+        ----------
+        hook_type : LifecycleHookType
+            The type of lifecycle hooks to execute
+        context : Optional[Dict[str, Any]]
+            Context information to pass to the hooks
+
+        Returns
+        -------
+        bool
+            True if all hooks executed successfully, False if any failed
+        """
+        if context is None:
+            context = {}
+
+        context.update({"system_name": self.name, "is_global_hook": True})
+
+        return await execute_lifecycle_hooks(
+            self.global_lifecycle_hooks, hook_type, context
+        )
 
 
 def load_mode_config(config_name: str) -> ModeSystemConfig:
@@ -250,7 +319,6 @@ def load_mode_config(config_name: str) -> ModeSystemConfig:
         default_mode=raw_config["default_mode"],
         config_name=config_name,
         allow_manual_switching=raw_config.get("allow_manual_switching", True),
-        transition_announcement=raw_config.get("transition_announcement", True),
         mode_memory_enabled=raw_config.get("mode_memory_enabled", True),
         api_key=g_api_key,
         robot_ip=g_robot_ip,
@@ -259,6 +327,10 @@ def load_mode_config(config_name: str) -> ModeSystemConfig:
         system_governance=raw_config.get("system_governance", ""),
         system_prompt_examples=raw_config.get("system_prompt_examples", ""),
         global_cortex_llm=raw_config.get("cortex_llm"),
+        global_lifecycle_hooks=parse_lifecycle_hooks(
+            raw_config.get("global_lifecycle_hooks", [])
+        ),
+        _raw_global_lifecycle_hooks=raw_config.get("global_lifecycle_hooks", []),
     )
 
     for mode_name, mode_data in raw_config.get("modes", {}).items():
@@ -268,8 +340,7 @@ def load_mode_config(config_name: str) -> ModeSystemConfig:
             description=mode_data.get("description", ""),
             system_prompt_base=mode_data["system_prompt_base"],
             hertz=mode_data.get("hertz", 1.0),
-            entry_message=mode_data.get("entry_message"),
-            exit_message=mode_data.get("exit_message"),
+            lifecycle_hooks=parse_lifecycle_hooks(mode_data.get("lifecycle_hooks", [])),
             timeout_seconds=mode_data.get("timeout_seconds"),
             remember_locations=mode_data.get("remember_locations", False),
             save_interactions=mode_data.get("save_interactions", False),
@@ -278,6 +349,7 @@ def load_mode_config(config_name: str) -> ModeSystemConfig:
             _raw_simulators=mode_data.get("simulators", []),
             _raw_actions=mode_data.get("agent_actions", []),
             _raw_backgrounds=mode_data.get("backgrounds", []),
+            _raw_lifecycle_hooks=mode_data.get("lifecycle_hooks", []),
         )
 
         mode_system_config.modes[mode_name] = mode_config
@@ -313,13 +385,19 @@ def _load_mode_components(mode_config: ModeConfig, system_config: ModeSystemConf
     g_ut_eth = system_config.unitree_ethernet
     g_URID = system_config.URID
     g_robot_ip = system_config.robot_ip
+    g_mode = mode_config.name
 
     # Load inputs
     mode_config.agent_inputs = [
         load_input(inp["type"])(
             config=SensorConfig(
                 **add_meta(
-                    inp.get("config", {}), g_api_key, g_ut_eth, g_URID, g_robot_ip
+                    inp.get("config", {}),
+                    g_api_key,
+                    g_ut_eth,
+                    g_URID,
+                    g_robot_ip,
+                    g_mode,
                 )
             )
         )
@@ -332,7 +410,12 @@ def _load_mode_components(mode_config: ModeConfig, system_config: ModeSystemConf
             config=SimulatorConfig(
                 name=sim["type"],
                 **add_meta(
-                    sim.get("config", {}), g_api_key, g_ut_eth, g_URID, g_robot_ip
+                    sim.get("config", {}),
+                    g_api_key,
+                    g_ut_eth,
+                    g_URID,
+                    g_robot_ip,
+                    g_mode,
                 ),
             )
         )
@@ -345,7 +428,12 @@ def _load_mode_components(mode_config: ModeConfig, system_config: ModeSystemConf
             {
                 **action,
                 "config": add_meta(
-                    action.get("config", {}), g_api_key, g_ut_eth, g_URID, g_robot_ip
+                    action.get("config", {}),
+                    g_api_key,
+                    g_ut_eth,
+                    g_URID,
+                    g_robot_ip,
+                    g_mode,
                 ),
             }
         )
@@ -357,7 +445,12 @@ def _load_mode_components(mode_config: ModeConfig, system_config: ModeSystemConf
         load_background(bg["type"])(
             config=BackgroundConfig(
                 **add_meta(
-                    bg.get("config", {}), g_api_key, g_ut_eth, g_URID, g_robot_ip
+                    bg.get("config", {}),
+                    g_api_key,
+                    g_ut_eth,
+                    g_URID,
+                    g_robot_ip,
+                    g_mode,
                 )
             )
         )
@@ -376,6 +469,7 @@ def _load_mode_components(mode_config: ModeConfig, system_config: ModeSystemConf
                     g_ut_eth,
                     g_URID,
                     g_robot_ip,
+                    g_mode,
                 )
             ),
             available_actions=mode_config.agent_actions,

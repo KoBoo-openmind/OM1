@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -10,6 +9,7 @@ from typing import Callable, Dict, List, Optional
 import zenoh
 
 from runtime.multi_mode.config import (
+    LifecycleHookType,
     ModeConfig,
     ModeSystemConfig,
     TransitionRule,
@@ -72,6 +72,7 @@ class ModeManager:
         self.transition_cooldowns: Dict[str, float] = {}
         self.pending_transitions: List[TransitionRule] = []
         self._transition_callbacks: List = []
+        self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Validate configuration
         if config.default_mode not in config.modes:
@@ -103,6 +104,17 @@ class ModeManager:
         logging.info(
             f"Mode Manager initialized with current mode: {self.state.current_mode}"
         )
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        """
+        Set the main event loop reference for thread-safe task scheduling.
+
+        Parameters
+        ----------
+        loop : asyncio.AbstractEventLoop
+            The main event loop reference
+        """
+        self._main_event_loop = loop
 
     @property
     def current_mode_config(self) -> ModeConfig:
@@ -171,7 +183,7 @@ class ModeManager:
             except Exception as e:
                 logging.error(f"Error in transition callback: {e}")
 
-    def check_time_based_transitions(self) -> Optional[str]:
+    async def check_time_based_transitions(self) -> Optional[str]:
         """
         Check if any time-based transitions should be triggered.
 
@@ -189,7 +201,20 @@ class ModeManager:
             current_config.timeout_seconds
             and mode_duration >= current_config.timeout_seconds
         ):
-            # Find time-based transition rules for this mode
+            timeout_context = {
+                "mode_name": self.state.current_mode,
+                "timeout_seconds": current_config.timeout_seconds,
+                "actual_duration": mode_duration,
+                "timestamp": current_time,
+            }
+
+            try:
+                await current_config.execute_lifecycle_hooks(
+                    LifecycleHookType.ON_TIMEOUT, timeout_context
+                )
+            except Exception as e:
+                logging.error(f"Error executing timeout lifecycle hooks: {e}")
+
             for rule in self.config.transition_rules:
                 if (
                     rule.from_mode == self.state.current_mode or rule.from_mode == "*"
@@ -276,7 +301,7 @@ class ModeManager:
             logging.warning(f"Target mode '{rule.to_mode}' not found in configuration")
             return False
 
-        # TODO: Add context-aware transition logic here if needed
+        # TODO: Add context-aware transition logic
 
         return True
 
@@ -334,6 +359,34 @@ class ModeManager:
             transition_key = f"{from_mode}->{target_mode}"
             self.transition_cooldowns[transition_key] = time.time()
 
+            from_config = self.config.modes.get(from_mode)
+            to_config = self.config.modes[target_mode]
+
+            transition_context = {
+                "from_mode": from_mode,
+                "to_mode": target_mode,
+                "reason": reason,
+                "timestamp": time.time(),
+                "transition_key": transition_key,
+            }
+
+            # Execute exit hooks for the current mode
+            if from_config:
+                logging.debug(f"Executing exit hooks for mode: {from_mode}")
+                exit_success = await from_config.execute_lifecycle_hooks(
+                    LifecycleHookType.ON_EXIT, transition_context.copy()
+                )
+                if not exit_success:
+                    logging.warning(f"Some exit hooks failed for mode: {from_mode}")
+
+            # Execute global exit hooks
+            global_exit_success = await self.config.execute_global_lifecycle_hooks(
+                LifecycleHookType.ON_EXIT, transition_context.copy()
+            )
+            if not global_exit_success:
+                logging.warning("Some global exit hooks failed")
+
+            # Update state
             self.state.previous_mode = from_mode
             self.state.current_mode = target_mode
             self.state.mode_start_time = time.time()
@@ -343,22 +396,24 @@ class ModeManager:
             if len(self.state.transition_history) > 50:
                 self.state.transition_history = self.state.transition_history[-25:]
 
-            from_config = self.config.modes.get(from_mode)
-            to_config = self.config.modes[target_mode]
-
             logging.info(
                 f"Mode transition: {from_mode} -> {target_mode} (reason: {reason})"
             )
 
-            if (
-                from_config
-                and from_config.exit_message
-                and self.config.transition_announcement
-            ):
-                logging.info(f"Exit message: {from_config.exit_message}")
+            # Execute entry hooks for the new mode
+            logging.debug(f"Executing entry hooks for mode: {target_mode}")
+            entry_success = await to_config.execute_lifecycle_hooks(
+                LifecycleHookType.ON_ENTRY, transition_context.copy()
+            )
+            if not entry_success:
+                logging.warning(f"Some entry hooks failed for mode: {target_mode}")
 
-            if to_config.entry_message and self.config.transition_announcement:
-                logging.info(f"Entry message: {to_config.entry_message}")
+            # Execute global entry hooks
+            global_entry_success = await self.config.execute_global_lifecycle_hooks(
+                LifecycleHookType.ON_ENTRY, transition_context.copy()
+            )
+            if not global_entry_success:
+                logging.warning("Some global entry hooks failed")
 
             await self._notify_transition_callbacks(from_mode, target_mode)
 
@@ -450,7 +505,7 @@ class ModeManager:
             The new mode if a transition occurred, None otherwise
         """
         # Check time-based transitions first
-        time_target = self.check_time_based_transitions()
+        time_target = await self.check_time_based_transitions()
         if time_target:
             success = await self._execute_transition(time_target, "timeout")
             if success:
@@ -486,21 +541,21 @@ class ModeManager:
 
         # Switch to specified mode
         if code == 0 and target_mode:
-            # Create async task to handle the transition and response
-            def run_async():
-                try:
-                    asyncio.run(
-                        self._handle_mode_switch_request(
-                            mode_status.header.frame_id,
-                            request_id.data,
-                            target_mode.data,
+            try:
+                if self._main_event_loop and self._main_event_loop.is_running():
+                    self._main_event_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(
+                            self._handle_mode_switch_request(
+                                mode_status.header.frame_id,
+                                request_id.data,
+                                target_mode.data,
+                            )
                         )
                     )
-                except Exception as e:
-                    logging.error(f"Error handling mode switch request: {e}")
-
-            thread = threading.Thread(target=run_async, daemon=True)
-            thread.start()
+                else:
+                    logging.error("Main event loop is not set or not running")
+            except Exception as e:
+                logging.error(f"Error scheduling mode switch request: {e}")
             return
 
         # Request current mode info

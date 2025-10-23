@@ -6,10 +6,9 @@ from actions.orchestrator import ActionOrchestrator
 from backgrounds.orchestrator import BackgroundOrchestrator
 from fuser import Fuser
 from inputs.orchestrator import InputOrchestrator
-from providers.elevenlabs_tts_provider import ElevenLabsTTSProvider
 from providers.io_provider import IOProvider
 from providers.sleep_ticker_provider import SleepTickerProvider
-from runtime.multi_mode.config import ModeSystemConfig, RuntimeConfig
+from runtime.multi_mode.config import LifecycleHookType, ModeSystemConfig, RuntimeConfig
 from runtime.multi_mode.manager import ModeManager
 from simulators.orchestrator import SimulatorOrchestrator
 
@@ -101,13 +100,6 @@ class ModeCortexRuntime:
 
             # Start new orchestrators
             await self._start_orchestrators()
-
-            # Play transition messages if enabled
-            if self.mode_config.transition_announcement:
-                to_config = self.mode_config.modes[to_mode]
-                if to_config.entry_message:
-                    ElevenLabsTTSProvider().add_pending_message(to_config.entry_message)
-                    logging.info(f"Mode entry: {to_config.entry_message}")
 
             logging.info(f"Successfully transitioned to mode: {to_mode}")
 
@@ -219,23 +211,32 @@ class ModeCortexRuntime:
         Start the mode-aware runtime's main execution loop.
         """
         try:
-            # Initialize the default mode if not already done
+            self.mode_manager.set_event_loop(asyncio.get_event_loop())
+
             if not self._mode_initialized:
+                # Execute global startup hooks
+                startup_context = {
+                    "system_name": self.mode_config.name,
+                    "initial_mode": self.mode_manager.current_mode_name,
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+
+                startup_success = await self.mode_config.execute_global_lifecycle_hooks(
+                    LifecycleHookType.ON_STARTUP, startup_context
+                )
+                if not startup_success:
+                    logging.warning("Some global startup hooks failed")
+
                 await self._initialize_mode(self.mode_manager.current_mode_name)
                 self._mode_initialized = True
 
-                # Play entry message for initial mode if enabled
-                if self.mode_config.transition_announcement:
-                    initial_mode_config = self.mode_config.modes[
-                        self.mode_manager.current_mode_name
-                    ]
-                    if initial_mode_config.entry_message:
-                        ElevenLabsTTSProvider().add_pending_message(
-                            initial_mode_config.entry_message
-                        )
-                        logging.info(
-                            f"Initial mode entry: {initial_mode_config.entry_message}"
-                        )
+                # Execute initial mode startup hooks
+                initial_mode_config = self.mode_config.modes[
+                    self.mode_manager.current_mode_name
+                ]
+                await initial_mode_config.execute_lifecycle_hooks(
+                    LifecycleHookType.ON_STARTUP, startup_context
+                )
 
             await self._start_orchestrators()
 
@@ -277,6 +278,27 @@ class ModeCortexRuntime:
             logging.error(f"Error in mode-aware cortex runtime: {e}")
             raise
         finally:
+            # Execute shutdown hooks before cleanup
+            shutdown_context = {
+                "system_name": self.mode_config.name,
+                "final_mode": self.mode_manager.current_mode_name,
+                "timestamp": asyncio.get_event_loop().time(),
+            }
+
+            # Execute current mode shutdown hooks
+            current_config = self.mode_config.modes.get(
+                self.mode_manager.current_mode_name
+            )
+            if current_config:
+                await current_config.execute_lifecycle_hooks(
+                    LifecycleHookType.ON_SHUTDOWN, shutdown_context
+                )
+
+            # Execute global shutdown hooks
+            await self.mode_config.execute_global_lifecycle_hooks(
+                LifecycleHookType.ON_SHUTDOWN, shutdown_context
+            )
+
             await self._cleanup_tasks()
 
     async def _run_cortex_loop(self) -> None:
@@ -285,8 +307,6 @@ class ModeCortexRuntime:
         """
         while True:
             try:
-                logging.info("Cortex loop tick")
-                logging.info("skip_sleep: %s", self.sleep_ticker_provider.skip_sleep)
                 if not self.sleep_ticker_provider.skip_sleep and self.current_config:
                     await self.sleep_ticker_provider.sleep(
                         1 / self.current_config.hertz

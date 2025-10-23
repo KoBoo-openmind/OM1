@@ -6,7 +6,7 @@ from uuid import uuid4
 import zenoh
 
 from actions.base import ActionConfig, ActionConnector
-from actions.speak.interface import SpeakInput
+from actions.emergency_alert.interface import EmergencyAlertInput
 from providers.asr_rtsp_provider import ASRRTSPProvider
 from providers.elevenlabs_tts_provider import ElevenLabsTTSProvider
 from providers.io_provider import IOProvider
@@ -15,7 +15,6 @@ from zenoh_msgs import (
     AudioStatus,
     String,
     TTSStatusRequest,
-    TTSStatusResponse,
     open_zenoh_session,
     prepare_header,
 )
@@ -23,7 +22,7 @@ from zenoh_msgs import (
 
 # unstable / not released
 # from zenoh.ext import HistoryConfig, Miss, RecoveryConfig, declare_advanced_subscriber
-class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
+class EmergencyAlertElevenLabsTTSConnector(ActionConnector[EmergencyAlertInput]):
 
     def __init__(self, config: ActionConfig):
 
@@ -42,16 +41,11 @@ class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
         model_id = getattr(self.config, "model_id", "eleven_flash_v2_5")
         output_format = getattr(self.config, "output_format", "mp3_44100_128")
 
-        # silence rate
-        self.silence_rate = getattr(self.config, "silence_rate", 0)
-        self.silence_counter = 0
-
         # IO Provider
         self.io_provider = IOProvider()
 
         self.audio_topic = "robot/status/audio"
         self.tts_status_request_topic = "om/tts/request"
-        self.tts_status_response_topic = "om/tts/response"
         self.session = None
         self.auido_pub = None
 
@@ -68,9 +62,6 @@ class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
             self.session.declare_subscriber(self.audio_topic, self.zenoh_audio_message)
             self.session.declare_subscriber(
                 self.tts_status_request_topic, self._zenoh_tts_status_request
-            )
-            self._zenoh_tts_status_response_pub = self.session.declare_publisher(
-                self.tts_status_response_topic
             )
 
             # Unstable / not released
@@ -117,24 +108,10 @@ class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
     def zenoh_audio_message(self, data: zenoh.Sample):
         self.audio_status = AudioStatus.deserialize(data.payload.to_bytes())
 
-    async def connect(self, output_interface: SpeakInput) -> None:
+    async def connect(self, output_interface: EmergencyAlertInput) -> None:
         if self.tts_enabled is False:
             logging.info("TTS is disabled, skipping TTS action")
             return
-
-        if (
-            self.silence_rate > 0
-            and self.silence_counter < self.silence_rate
-            and self.io_provider.llm_prompt is not None
-            and "INPUT: Voice" not in self.io_provider.llm_prompt
-        ):
-            self.silence_counter += 1
-            logging.info(
-                f"Skipping TTS due to silence_rate {self.silence_rate}, counter {self.silence_counter}"
-            )
-            return
-
-        self.silence_counter = 0
 
         # Add pending message to TTS
         pending_message = self.tts.create_pending_message(output_interface.action)
@@ -145,6 +122,13 @@ class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
             and "INPUT: Voice" in self.io_provider.llm_prompt
         ):
             self.conversation_provider.store_robot_message(output_interface.action)
+
+        # Avoid queuing too many TTS messages
+        if self.tts.get_pending_message_count() > 0:
+            logging.warning(
+                "Too many pending TTS messages, skipping adding new message"
+            )
+            return
 
         state = AudioStatus(
             header=prepare_header(str(uuid4())),
@@ -173,62 +157,13 @@ class SpeakElevenLabsTTSConnector(ActionConnector[SpeakInput]):
         logging.info(f"Received TTS Control Status message: {tts_status}")
 
         code = tts_status.code
-        request_id = tts_status.request_id
-
-        # Read the current status
-        if code == 2:
-            tts_status_response = TTSStatusResponse(
-                header=prepare_header(tts_status.header.frame_id),
-                request_id=request_id,
-                code=1 if self.tts_enabled else 0,
-                status=String(
-                    data=("TTS Enabled" if self.tts_enabled else "TTS Disabled")
-                ),
-            )
-            return self._zenoh_tts_status_response_pub.put(
-                tts_status_response.serialize()
-            )
 
         # Enable the TTS
         if code == 1:
             self.tts_enabled = True
             logging.info("TTS Enabled")
 
-            ai_status_response = TTSStatusResponse(
-                header=prepare_header(tts_status.header.frame_id),
-                request_id=request_id,
-                code=1,
-                status=String(data="TTS Enabled"),
-            )
-            return self._zenoh_tts_status_response_pub.put(
-                ai_status_response.serialize()
-            )
-
         # Disable the TTS
         if code == 0:
             self.tts_enabled = False
             logging.info("TTS Disabled")
-            ai_status_response = TTSStatusResponse(
-                header=prepare_header(tts_status.header.frame_id),
-                request_id=request_id,
-                code=0,
-                status=String(data="TTS Disabled"),
-            )
-
-            return self._zenoh_tts_status_response_pub.put(
-                ai_status_response.serialize()
-            )
-
-    def stop(self) -> None:
-        """
-        Stop the Elevenlabs TTS connector and cleanup resources.
-        """
-        if self.session:
-            self.session.close()
-            logging.info("Elevenlabs TTS Zenoh client closed")
-
-        if self.asr:
-            self.asr.stop()
-
-        if self.tts:
-            self.tts.stop()

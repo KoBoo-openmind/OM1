@@ -7,25 +7,27 @@ from runtime.multi_mode.cortex import ModeCortexRuntime
 
 
 @pytest.fixture
-def mock_mode_config():
-    """Mock mode configuration for testing."""
-    mode_config = Mock(spec=ModeConfig)
-    mode_config.name = "test_mode"
-    mode_config.display_name = "Test Mode"
-    mode_config.description = "Test mode for unit testing"
-    mode_config.hertz = 2.0
-    mode_config.entry_message = "Entering test mode"
-    mode_config.exit_message = "Exiting test mode"
-
-    mode_config.load_components = Mock()
-
-    mock_runtime_config = Mock()
-    mock_runtime_config.hertz = 2.0
-    mock_runtime_config.agent_inputs = []
-    mock_runtime_config.cortex_llm = Mock()
-    mode_config.to_runtime_config = Mock(return_value=mock_runtime_config)
-
+def sample_mode_config():
+    mode_config = ModeConfig(
+        name="test_mode",
+        display_name="Test Mode",
+        description="A test mode",
+        system_prompt_base="You are a test agent",
+    )
     return mode_config
+
+
+@pytest.fixture
+def mock_mode_config():
+    """Mock mode config for testing."""
+    mock_config = Mock(spec=ModeConfig)
+    mock_config.name = "test_mode"
+    mock_config.display_name = "Test Mode"
+    mock_config.description = "A test mode"
+    mock_config.system_prompt_base = "You are a test agent"
+    mock_config.load_components = Mock()
+    mock_config.to_runtime_config = Mock()
+    return mock_config
 
 
 @pytest.fixture
@@ -34,7 +36,6 @@ def mock_system_config(mock_mode_config):
     config = Mock(spec=ModeSystemConfig)
     config.name = "test_system"
     config.default_mode = "default"
-    config.transition_announcement = True
     config.modes = {
         "default": mock_mode_config,
         "advanced": mock_mode_config,
@@ -175,51 +176,46 @@ class TestModeCortexRuntime:
             patch.object(runtime, "_stop_current_orchestrators") as mock_stop,
             patch.object(runtime, "_initialize_mode") as mock_init,
             patch.object(runtime, "_start_orchestrators") as mock_start,
-            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider") as mock_tts_class,
         ):
-            mock_tts = Mock()
-            mock_tts.add_pending_message = Mock()
-            mock_tts_class.return_value = mock_tts
-
-            mock_mode = Mock()
-            mock_mode.entry_message = "Welcome to new mode"
-            runtime.mode_config.modes = {"to_mode": mock_mode}
+            mock_from_mode = Mock()
+            mock_to_mode = Mock()
+            runtime.mode_config.modes = {
+                "from_mode": mock_from_mode,
+                "to_mode": mock_to_mode,
+            }
 
             await runtime._on_mode_transition("from_mode", "to_mode")
 
             mock_stop.assert_called_once()
             mock_init.assert_called_once_with("to_mode")
             mock_start.assert_called_once()
-            mock_tts.add_pending_message.assert_called_once_with("Welcome to new mode")
 
     @pytest.mark.asyncio
     async def test_on_mode_transition_no_announcement(self, cortex_runtime):
         """Test mode transition without announcement."""
         runtime, mocks = cortex_runtime
-        runtime.mode_config.transition_announcement = False
 
         with (
             patch.object(runtime, "_stop_current_orchestrators"),
             patch.object(runtime, "_initialize_mode"),
             patch.object(runtime, "_start_orchestrators"),
-            patch("runtime.multi_mode.cortex.ElevenLabsTTSProvider") as mock_tts_class,
         ):
-            mock_tts = Mock()
-            mock_tts.add_pending_message = Mock()
-            mock_tts_class.return_value = mock_tts
-
             mock_mode = Mock()
-            mock_mode.entry_message = "Welcome"
             runtime.mode_config.modes = {"to_mode": mock_mode}
 
             await runtime._on_mode_transition("from_mode", "to_mode")
-
-            mock_tts.add_pending_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_mode_transition_exception(self, cortex_runtime):
         """Test mode transition with exception handling."""
         runtime, mocks = cortex_runtime
+
+        mock_from_mode = Mock()
+        mock_to_mode = Mock()
+        runtime.mode_config.modes = {
+            "from_mode": mock_from_mode,
+            "to_mode": mock_to_mode,
+        }
 
         with patch.object(
             runtime, "_stop_current_orchestrators", side_effect=Exception("Test error")
