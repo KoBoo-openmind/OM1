@@ -28,7 +28,7 @@ You will need the [`uv` package manager](https://docs.astral.sh/uv/getting-start
 ```bash
 git clone https://github.com/openmind/OM1.git
 cd OM1
-git submodule update --init
+git submodule update --init --recursive
 uv venv
 ```
 
