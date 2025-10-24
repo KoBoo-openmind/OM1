@@ -72,8 +72,8 @@ OM1 assumes that robot hardware provides a high-level SDK that accepts elemental
 ```python
 ...
 elif output_interface.action == "shake paw":
-    if self.sport_client:
-        self.sport_client.Hello()
+    if getattr(self, "spot_client", None):
+        self.spot_client.Hello()
 ...
 ```
 
